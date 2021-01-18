@@ -8,7 +8,9 @@ using System.Collections.Generic;
 using TouchScript.Pointers;
 using TouchScript.Utils;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.Profiling;
+using UnityInput;
 
 namespace TouchScript.InputSources.InputHandlers
 {
@@ -35,6 +37,10 @@ namespace TouchScript.InputSources.InputHandlers
 
         #region Private variables
 
+#if ENABLE_INPUT_SYSTEM
+        private PointerControls _controls;
+#endif
+
         private IInputSource input;
         private PointerDelegate addPointer;
         private PointerDelegate updatePointer;
@@ -49,7 +55,7 @@ namespace TouchScript.InputSources.InputHandlers
         private int pointersNum;
 
 #if UNITY_5_6_OR_NEWER
-		private CustomSampler updateSampler;
+        private CustomSampler updateSampler;
 #endif
 
         #endregion
@@ -77,18 +83,123 @@ namespace TouchScript.InputSources.InputHandlers
             touchPool = new ObjectPool<TouchPointer>(10, newPointer, null, resetPointer, "TouchHandler/Touch");
             touchPool.Name = "Touch";
 
+#if ENABLE_INPUT_SYSTEM
+            _controls = new PointerControls();
+            _controls.pointer.point.started += OnPointerActionStarted;
+            _controls.pointer.point.performed += OnPointerAction;
+            _controls.pointer.point.canceled += OnPointerActionCanceled;
+#endif
+
 #if UNITY_5_6_OR_NEWER
-			updateSampler = CustomSampler.Create("[TouchScript] Update Touch");
+            updateSampler = CustomSampler.Create("[TouchScript] Update Touch");
 #endif
         }
+
+#if ENABLE_INPUT_SYSTEM
+        UnityInput.Gestures.PointerInput retrievePointerInput(InputAction.CallbackContext context)
+        {
+            var control = context.control;
+            var device = control.device;
+
+            // Read our current pointer values.
+            var drag = context.ReadValue<UnityInput.Gestures.PointerInput>();
+
+            // Fix input for mice/pens
+            if (device is Mouse)
+            {
+                drag.InputId = UnityEngine.EventSystems.PointerInputModule.kMouseLeftId;
+            }
+            else if (device is Pen)
+            {
+                drag.InputId = int.MinValue;
+            }
+
+            return drag;
+        }
+
+        protected void OnPointerActionStarted(InputAction.CallbackContext context)
+        {
+            var touch = retrievePointerInput(context);
+
+            if (systemToInternalId.TryGetValue(touch.InputId, out var touchState) &&
+                touchState.Phase != UnityEngine.TouchPhase.Canceled)
+            {
+                // Ending previous touch (missed a frame)
+                internalRemovePointer(touchState.Pointer);
+                systemToInternalId[touch.InputId] = new TouchState(internalAddPointer(touch.Position));
+            }
+            else
+            {
+                systemToInternalId.Add(touch.InputId, new TouchState(internalAddPointer(touch.Position)));
+            }
+        }
+
+        protected void OnPointerAction(InputAction.CallbackContext context)
+        {
+            var touch = retrievePointerInput(context);
+
+            if (touch.Contact)
+            {
+                if (systemToInternalId.TryGetValue(touch.InputId, out var touchState))
+                {
+                    if (touchState.Phase != UnityEngine.TouchPhase.Canceled)
+                    {
+                        touchState.Pointer.Position = remapCoordinates(touch.Position);
+                        updatePointer(touchState.Pointer);
+                    }
+                }
+                else
+                {
+                    // Missed began phase
+                    systemToInternalId.Add(touch.InputId, new TouchState(internalAddPointer(touch.Position)));
+                }
+            }
+            else
+            {
+                if (systemToInternalId.TryGetValue(touch.InputId, out var touchState))
+                {
+                    systemToInternalId.Remove(touch.InputId);
+                    if (touchState.Phase != UnityEngine.TouchPhase.Canceled)
+                        internalRemovePointer(touchState.Pointer);
+                }
+                else
+                {
+                    // Missed one finger begin-end transition
+                    var pointer = internalAddPointer(touch.Position);
+                    internalRemovePointer(pointer);
+                }
+            }
+        }
+
+        protected void OnPointerActionCanceled(InputAction.CallbackContext context)
+        {
+            var touch = retrievePointerInput(context);
+
+            if (systemToInternalId.TryGetValue(touch.InputId, out var touchState))
+            {
+                systemToInternalId.Remove(touch.InputId);
+                if (touchState.Phase != UnityEngine.TouchPhase.Canceled)
+                    internalCancelPointer(touchState.Pointer);
+            }
+            else
+            {
+                // Missed one finger begin-end transition
+                var pointer = internalAddPointer(touch.Position);
+                internalCancelPointer(pointer);
+            }
+        }
+#endif
 
         #region Public methods
 
         /// <inheritdoc />
         public bool UpdateInput()
         {
+#if ENABLE_INPUT_SYSTEM
+            return systemToInternalId.Count > 0;
+#else
 #if UNITY_5_6_OR_NEWER
-			updateSampler.Begin();
+            updateSampler.Begin();
 #endif
 
             for (var i = 0; i < Input.touchCount; ++i)
@@ -98,8 +209,8 @@ namespace TouchScript.InputSources.InputHandlers
                 TouchState touchState;
                 switch (t.phase)
                 {
-                    case TouchPhase.Began:
-                        if (systemToInternalId.TryGetValue(t.fingerId, out touchState) && touchState.Phase != TouchPhase.Canceled)
+                    case UnityEngine.TouchPhase.Began:
+                        if (systemToInternalId.TryGetValue(t.fingerId, out touchState) && touchState.Phase != UnityEngine.TouchPhase.Canceled)
                         {
                             // Ending previous touch (missed a frame)
                             internalRemovePointer(touchState.Pointer);
@@ -110,10 +221,10 @@ namespace TouchScript.InputSources.InputHandlers
                             systemToInternalId.Add(t.fingerId, new TouchState(internalAddPointer(t.position)));
                         }
                         break;
-                    case TouchPhase.Moved:
+                    case UnityEngine.TouchPhase.Moved:
                         if (systemToInternalId.TryGetValue(t.fingerId, out touchState))
                         {
-                            if (touchState.Phase != TouchPhase.Canceled)
+                            if (touchState.Phase != UnityEngine.TouchPhase.Canceled)
                             {
                                 touchState.Pointer.Position = remapCoordinates(t.position);
                                 updatePointer(touchState.Pointer);
@@ -127,11 +238,11 @@ namespace TouchScript.InputSources.InputHandlers
                         break;
                     // NOTE: Unity touch on Windows reports Cancelled as Ended
                     // when a touch goes out of display boundary
-                    case TouchPhase.Ended:
+                    case UnityEngine.TouchPhase.Ended:
                         if (systemToInternalId.TryGetValue(t.fingerId, out touchState))
                         {
                             systemToInternalId.Remove(t.fingerId);
-                            if (touchState.Phase != TouchPhase.Canceled) internalRemovePointer(touchState.Pointer);
+                            if (touchState.Phase != UnityEngine.TouchPhase.Canceled) internalRemovePointer(touchState.Pointer);
                         }
                         else
                         {
@@ -140,11 +251,11 @@ namespace TouchScript.InputSources.InputHandlers
                             internalRemovePointer(pointer);
                         }
                         break;
-                    case TouchPhase.Canceled:
+                    case UnityEngine.TouchPhase.Canceled:
                         if (systemToInternalId.TryGetValue(t.fingerId, out touchState))
                         {
                             systemToInternalId.Remove(t.fingerId);
-                            if (touchState.Phase != TouchPhase.Canceled) internalCancelPointer(touchState.Pointer);
+                            if (touchState.Phase != UnityEngine.TouchPhase.Canceled) internalCancelPointer(touchState.Pointer);
                         }
                         else
                         {
@@ -153,7 +264,7 @@ namespace TouchScript.InputSources.InputHandlers
                             internalCancelPointer(pointer);
                         }
                         break;
-                    case TouchPhase.Stationary:
+                    case UnityEngine.TouchPhase.Stationary:
                         if (systemToInternalId.TryGetValue(t.fingerId, out touchState)) {}
                         else
                         {
@@ -165,17 +276,18 @@ namespace TouchScript.InputSources.InputHandlers
             }
 
 #if UNITY_5_6_OR_NEWER
-			updateSampler.End();
+            updateSampler.End();
 #endif
 
             return Input.touchCount > 0;
+#endif
         }
 
         /// <inheritdoc />
         public void UpdateResolution(int width, int height) {}
 
         /// <inheritdoc />
-        public bool CancelPointer(Pointer pointer, bool shouldReturn)
+        public bool CancelPointer(Pointers.Pointer pointer, bool shouldReturn)
         {
             var touch = pointer as TouchPointer;
             if (touch == null) return false;
@@ -183,7 +295,7 @@ namespace TouchScript.InputSources.InputHandlers
             int fingerId = -1;
             foreach (var touchState in systemToInternalId)
             {
-                if (touchState.Value.Pointer == touch && touchState.Value.Phase != TouchPhase.Canceled)
+                if (touchState.Value.Pointer == touch && touchState.Value.Phase != UnityEngine.TouchPhase.Canceled)
                 {
                     fingerId = touchState.Key;
                     break;
@@ -193,14 +305,14 @@ namespace TouchScript.InputSources.InputHandlers
             {
                 internalCancelPointer(touch);
                 if (shouldReturn) systemToInternalId[fingerId] = new TouchState(internalReturnPointer(touch));
-                else systemToInternalId[fingerId] = new TouchState(touch, TouchPhase.Canceled);
+                else systemToInternalId[fingerId] = new TouchState(touch, UnityEngine.TouchPhase.Canceled);
                 return true;
             }
             return false;
         }
 
         /// <inheritdoc />
-        public bool DiscardPointer(Pointer pointer)
+        public bool DiscardPointer(Pointers.Pointer pointer)
         {
             var p = pointer as TouchPointer;
             if (p == null) return false;
@@ -216,21 +328,21 @@ namespace TouchScript.InputSources.InputHandlers
         {
             foreach (var touchState in systemToInternalId)
             {
-                if (touchState.Value.Phase != TouchPhase.Canceled) internalCancelPointer(touchState.Value.Pointer);
+                if (touchState.Value.Phase != UnityEngine.TouchPhase.Canceled) internalCancelPointer(touchState.Value.Pointer);
             }
             systemToInternalId.Clear();
         }
 
-        #endregion
+#endregion
 
-        #region Private functions
+#region Private functions
 
-        private Pointer internalAddPointer(Vector2 position)
+        private Pointers.Pointer internalAddPointer(Vector2 position)
         {
             pointersNum++;
             var pointer = touchPool.Get();
             pointer.Position = remapCoordinates(position);
-            pointer.Buttons |= Pointer.PointerButtonState.FirstButtonDown | Pointer.PointerButtonState.FirstButtonPressed;
+            pointer.Buttons |= Pointers.Pointer.PointerButtonState.FirstButtonDown | Pointers.Pointer.PointerButtonState.FirstButtonPressed;
             addPointer(pointer);
             pressPointer(pointer);
             return pointer;
@@ -241,23 +353,23 @@ namespace TouchScript.InputSources.InputHandlers
             pointersNum++;
             var newPointer = touchPool.Get();
             newPointer.CopyFrom(pointer);
-            pointer.Buttons |= Pointer.PointerButtonState.FirstButtonDown | Pointer.PointerButtonState.FirstButtonPressed;
-            newPointer.Flags |= Pointer.FLAG_RETURNED;
+            pointer.Buttons |= Pointers.Pointer.PointerButtonState.FirstButtonDown | Pointers.Pointer.PointerButtonState.FirstButtonPressed;
+            newPointer.Flags |= Pointers.Pointer.FLAG_RETURNED;
             addPointer(newPointer);
             pressPointer(newPointer);
             return newPointer;
         }
 
-        private void internalRemovePointer(Pointer pointer)
+        private void internalRemovePointer(Pointers.Pointer pointer)
         {
             pointersNum--;
-            pointer.Buttons &= ~Pointer.PointerButtonState.FirstButtonPressed;
-            pointer.Buttons |= Pointer.PointerButtonState.FirstButtonUp;
+            pointer.Buttons &= ~Pointers.Pointer.PointerButtonState.FirstButtonPressed;
+            pointer.Buttons |= Pointers.Pointer.PointerButtonState.FirstButtonUp;
             releasePointer(pointer);
             removePointer(pointer);
         }
 
-        private void internalCancelPointer(Pointer pointer)
+        private void internalCancelPointer(Pointers.Pointer pointer)
         {
             pointersNum--;
             cancelPointer(pointer);
@@ -269,7 +381,7 @@ namespace TouchScript.InputSources.InputHandlers
             return position;
         }
 
-        private void resetPointer(Pointer p)
+        private void resetPointer(Pointers.Pointer p)
         {
             p.INTERNAL_Reset();
         }
@@ -279,14 +391,14 @@ namespace TouchScript.InputSources.InputHandlers
             return new TouchPointer(input);
         }
 
-        #endregion
+#endregion
 
         private struct TouchState
         {
-            public Pointer Pointer;
-            public TouchPhase Phase;
+            public Pointers.Pointer Pointer;
+            public UnityEngine.TouchPhase Phase;
 
-            public TouchState(Pointer pointer, TouchPhase phase = TouchPhase.Began)
+            public TouchState(Pointers.Pointer pointer, UnityEngine.TouchPhase phase = UnityEngine.TouchPhase.Began)
             {
                 Pointer = pointer;
                 Phase = phase;
