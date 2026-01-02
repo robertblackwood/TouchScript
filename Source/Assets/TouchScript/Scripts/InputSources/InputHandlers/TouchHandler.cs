@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using TouchScript.Pointers;
 using TouchScript.Utils;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 using UnityEngine.Profiling;
 using UnityInput;
@@ -39,6 +40,14 @@ namespace TouchScript.InputSources.InputHandlers
 
 #if ENABLE_INPUT_SYSTEM
         private PointerControls _controls;
+
+        public struct PointerInput
+        {
+            public int InputId;
+            public Vector2 Position;
+            public Vector2 Delta;
+            public bool Contact;
+        }
 #endif
 
         private IInputSource input;
@@ -96,25 +105,34 @@ namespace TouchScript.InputSources.InputHandlers
         }
 
 #if ENABLE_INPUT_SYSTEM
-        UnityInput.Gestures.PointerInput retrievePointerInput(InputAction.CallbackContext context)
+        PointerInput retrievePointerInput(InputAction.CallbackContext context)
         {
             var control = context.control;
             var device = control.device;
 
-            // Read our current pointer values.
-            var drag = context.ReadValue<UnityInput.Gestures.PointerInput>();
+            var pointer = new PointerInput();
 
-            // Fix input for mice/pens
+            // Position / delta
+            if (device is UnityEngine.InputSystem.Pointer pointerDevice)
+            {
+                pointer.Position = pointerDevice.position.ReadValue();
+                pointer.Delta = pointerDevice.delta.ReadValue();
+                pointer.InputId = pointerDevice.deviceId;
+                pointer.Contact = pointerDevice.press.isPressed;
+            }
+
+            // Mouse fixup
             if (device is Mouse)
             {
-                drag.InputId = UnityEngine.EventSystems.PointerInputModule.kMouseLeftId;
+                pointer.InputId = PointerInputModule.kMouseLeftId;
             }
+            // Pen fixup
             else if (device is Pen)
             {
-                drag.InputId = int.MinValue;
+                pointer.InputId = int.MinValue;
             }
 
-            return drag;
+            return pointer;
         }
 
         protected void OnPointerActionStarted(InputAction.CallbackContext context)
